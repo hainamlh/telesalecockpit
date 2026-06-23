@@ -1535,12 +1535,11 @@ function startApp(){
   chip.textContent=CURRENT_USER.display_name.charAt(0).toUpperCase();
   if(CURRENT_USER.role==='admin')chip.classList.add('admin');
   document.getElementById('user-display-chip').textContent=CURRENT_USER.display_name;
-  // Hiện nút Edit Nhắc nhở cho tất cả user
-  var tickerBtn = document.getElementById('btn-edit-ticker');
-  if(tickerBtn) tickerBtn.style.display = 'inline-flex';
-  // show admin tab
+  // Hiện nút Edit Nhắc nhở chỉ cho Admin
   if(CURRENT_USER.role==='admin'){
     document.getElementById('nav-admin').style.display='flex';
+    var tickerBtn = document.getElementById('btn-edit-ticker');
+    if(tickerBtn) tickerBtn.style.display = 'inline-flex';
     var followupBtn = document.getElementById('btn-edit-followup');
     if(followupBtn) followupBtn.style.display = 'inline-flex';
     var followupBtnCrm = document.getElementById('btn-edit-followup-crm');
@@ -1656,7 +1655,12 @@ async function loadAppData(key){
   if(!CURRENT_USER)return null;
   try{
     var rows=await sbGet('nct_app_data','user_id=eq.'+CURRENT_USER.id+'&key=eq.'+encodeURIComponent(key)+'&select=value');
-    if(rows&&rows.length)return JSON.parse(rows[0].value);
+    if(rows&&rows.length){
+      var parsed=JSON.parse(rows[0].value);
+      console.log('[loadAppData]',key,'→',Array.isArray(parsed)?parsed.length+' items':parsed);
+      return parsed;
+    }
+    console.log('[loadAppData]',key,'→ không có data');
     return null;
   }catch(e){return null;}
 }
@@ -1664,7 +1668,11 @@ async function saveAppData(key,val){
   if(!CURRENT_USER)return;
   try{
     await sbUpsert('nct_app_data',[{user_id:CURRENT_USER.id,key:key,value:JSON.stringify(val)}],'user_id,key');
-  }catch(e){}
+    console.log('[saveAppData] OK:',key);
+  }catch(e){
+    console.error('[saveAppData] Lỗi key='+key+':',e.message);
+    if(key==='tickers') showToast('⚠ Không lưu được Nhắc nhở: '+e.message,'err');
+  }
 }
 
 // =========================================================
@@ -1714,9 +1722,20 @@ async function loadUserData(){
     var sc=await loadAppData('scripts');
     var ob=await loadAppData('objs');
     var tk=await loadAppData('tickers');
+    // Nếu chưa có tickers riêng → load master_tickers từ Admin
+    if(!Array.isArray(tk)){
+      try{
+        var adminUsers=await sbGet('nct_users','role=eq.admin&select=id');
+        if(adminUsers&&adminUsers.length){
+          var adminId=adminUsers[0].id;
+          var masterRows=await sbGet('nct_app_data','user_id=eq.'+adminId+'&key=eq.master_tickers&select=value');
+          if(masterRows&&masterRows.length){tk=JSON.parse(masterRows[0].value);console.log('[loadUserData] Dùng master_tickers:',tk.length,'items');}
+        }
+      }catch(ex){console.warn('[loadUserData] Không load được master_tickers:',ex.message);}
+    }
     D.scripts=sc||defaultScripts;
     D.objs=ob||defaultObjs;
-    if(tk&&tk.length) TICKERS=tk;
+    if(Array.isArray(tk)) TICKERS=tk;
     // hist
     _histCache=await loadHist();
     // crm
@@ -1725,7 +1744,7 @@ async function loadUserData(){
   }catch(e){
     D.scripts=defaultScripts;D.objs=defaultObjs;
     _histCache=loadHistLocal();_crmCache=loadCRMLocal();
-    try{var tkLocal=localStorage.getItem('nct_tickers');if(tkLocal)TICKERS=JSON.parse(tkLocal);}catch(ex){}
+    try{var tkLocal=localStorage.getItem('nct_tickers');if(tkLocal){var tkParsed=JSON.parse(tkLocal);if(Array.isArray(tkParsed))TICKERS=tkParsed;}}catch(ex){}
     setSyncStatus('err');
   }
   renderAll();
@@ -2378,7 +2397,7 @@ function nextContact(){
   if(_currentIdx >= _contacts.length) _currentIdx = _contacts.length;
   renderKHCard();
   doResetTimer();
-  saveTodayToHistory();
+  saveHeatmapNow();
 }
 
 function doResetTimer(){
@@ -2422,9 +2441,14 @@ function resetCallTimer(){
 function saveHeatmapNow(){
   (async function(){
     var key=todayKey();
-    var rec={calls:_sessionCalls,answered:_sessionAnswered,deep:0,appt:_sessionFollowup,mins:_sessionMins,
-      r1:_sessionCalls>0?Math.round(_sessionAnswered/_sessionCalls*100):0,
-      r2:_sessionAnswered>0?Math.round(_sessionFollowup/_sessionAnswered*100):0};
+    // Merge session (Campaign) + counts (Logger) để không mất data từ cả 2 nguồn
+    var totalCalls   = _sessionCalls   + (counts.calls||0);
+    var totalAnswered= _sessionAnswered + (counts.answered||0);
+    var totalFollowup= _sessionFollowup + (counts.appt||0);
+    var totalMins    = _sessionMins     + (counts.mins||0);
+    var rec={calls:totalCalls,answered:totalAnswered,deep:0,appt:totalFollowup,mins:totalMins,
+      r1:totalCalls>0?Math.round(totalAnswered/totalCalls*100):0,
+      r2:totalAnswered>0?Math.round(totalFollowup/totalAnswered*100):0};
     if(!_histCache)_histCache={};
     _histCache[key]=rec;
     await saveHistDay(key,rec);
@@ -3477,13 +3501,13 @@ async function loadMemberCRM(userId){
     var list=Array.isArray(crms)?crms:[];
     if(!list.length){document.getElementById('md-crm-content').innerHTML='<div style="text-align:center;padding:20px;color:var(--th)">Chưa có KH theo dõi</div>';return;}
     var today=todayKey();
-    var tbl='<table class="team-table admin-crm-view"><thead><tr><th>#</th><th>Tên KH</th><th>Địa chỉ</th><th style="white-space:nowrap">NAV</th><th style="white-space:nowrap">Hành động</th><th>Bắt đầu gọi</th><th>Next action</th><th>Ghi chú</th></tr></thead><tbody>'
+    var tbl='<table class="team-table admin-crm-view" style="table-layout:fixed;width:100%"><thead><tr><th style="width:36px">#</th><th style="width:110px">Tên KH</th><th style="width:160px">Địa chỉ</th><th style="width:70px;white-space:nowrap">NAV</th><th style="width:110px;white-space:nowrap">Hành động</th><th style="width:100px;white-space:nowrap">Bắt đầu gọi</th><th style="width:160px;white-space:nowrap">Next action</th><th>Ghi chú</th></tr></thead><tbody>'
       +list.map(function(kh,i){
         var ac=AC_META[kh.action]||AC_META.call;
         var isOver=kh.nextdate&&kh.nextdate<today;var isToday=kh.nextdate===today;
         var sp=kh.startdate?(function(){var p=kh.startdate.split('-');return p[2]+'/'+p[1]+'/'+p[0];})():'—';
         var nd='—';if(kh.nextdate){var np=kh.nextdate.split('-');var dl=np[2]+'/'+np[1]+'/'+np[0];if(isOver)nd='<span style="color:#A32D2D;font-weight:600">⚠ '+dl+'</span>';else if(isToday)nd='<span style="color:var(--ad);font-weight:600">★ '+dl+'</span>';else nd=dl;}
-        return '<tr><td style="color:var(--th);font-size:11px">'+(i+1)+'</td><td style="font-weight:600">'+esc(kh.name||'')+'</td><td style="font-size:12px;color:var(--tm)">'+esc(kh.address||'—')+'</td><td style="white-space:nowrap">'+(kh.nav?kh.nav+' tỷ':'—')+'</td><td style="white-space:nowrap"><span class="acbadge '+ac.c+'" style="font-size:12px;padding:3px 8px"><i class="ti '+ac.i+'"></i>'+ac.l+'</span></td><td>'+sp+'</td><td>'+nd+'</td><td style="font-size:12px;color:var(--tm);max-width:300px;word-break:break-word;white-space:normal">'+esc(kh.note||'—')+'</td></tr>';
+        return '<tr><td style="color:var(--th);font-size:11px">'+(i+1)+'</td><td style="font-weight:600;word-break:break-word">'+esc(kh.name||'')+'</td><td style="font-size:12px;color:var(--tm);word-break:break-word;white-space:normal">'+esc(kh.address||'—')+'</td><td style="white-space:nowrap">'+(kh.nav?kh.nav+' tỷ':'—')+'</td><td style="white-space:nowrap"><span class="acbadge '+ac.c+'" style="font-size:12px;padding:3px 8px"><i class="ti '+ac.i+'"></i>'+ac.l+'</span></td><td style="white-space:nowrap">'+sp+'</td><td style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+nd+'</td><td style="font-size:12px;color:var(--tm);word-break:break-word;white-space:normal">'+esc(kh.note||'—')+'</td></tr>';
       }).join('')+'</tbody></table>';
     document.getElementById('md-crm-content').innerHTML='<div style="overflow-x:auto">'+tbl+'</div>';
   }catch(e){document.getElementById('md-crm-content').innerHTML='<div style="color:#A32D2D;padding:12px">Lỗi tải dữ liệu KH</div>';}
@@ -3532,7 +3556,7 @@ function syncLogHeight(){
 // TOAST & RENDER ALL
 // =========================================================
 function showToast(msg,type){var t=document.getElementById('toast');document.getElementById('toast-msg').textContent=msg;t.style.background=type==='err'?'#A32D2D':'';t.classList.add('show');setTimeout(function(){t.classList.remove('show');t.style.background='';},3000);}
-function renderAll(){renderScripts();renderObjs();renderFollowup();}
+function renderAll(){renderScripts();renderObjs();renderFollowup();buildTicker();}
 // Close popups on backdrop click
 document.addEventListener('DOMContentLoaded',function(){
   ['script-popup','obj-popup'].forEach(function(id){
