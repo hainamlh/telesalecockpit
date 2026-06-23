@@ -1397,7 +1397,7 @@ textarea.fi2{min-height:72px;resize:vertical}
 <div class="ticker-bar">
   <div class="ticker-label" style="display:flex;align-items:center;gap:6px">
     NHẮC NHỞ
-    <button id="btn-edit-ticker" onclick="openStageEditor('tickers')" style="display:none;background:none;border:none;color:#fff;cursor:pointer;padding:0;font-size:12px;display:inline-flex;align-items:center;justify-content:center" title="Sửa nhắc nhở"><i class="ti ti-pencil"></i></button>
+    <button id="btn-edit-ticker" onclick="openStageEditor('tickers')" style="display:none;background:none;border:none;color:#fff;cursor:pointer;padding:0;font-size:12px;display:inline-flex;align-items:center;justify-content:center" title="Edit"><i class="ti ti-pencil"></i></button>
   </div>
   <div class="ticker-track"><div class="ticker-inner" id="ticker-inner"></div></div>
 </div>
@@ -1440,7 +1440,16 @@ function sbPost(table,body){
 function sbUpsert(table,body,onConflict){
   var h=Object.assign({},SB_HDR,{'Prefer':'resolution=merge-duplicates,return=representation'});
   var url=SB_URL+'/rest/v1/'+table+(onConflict?'?on_conflict='+onConflict:'');
-  return fetch(url,{method:'POST',headers:h,body:JSON.stringify(body)}).then(function(r){return r.json();});
+  return fetch(url,{method:'POST',headers:h,body:JSON.stringify(body)}).then(function(r){
+    return r.json().then(function(data){
+      if(!r.ok){
+        var msg=(data&&data.message)||(data&&data.error)||('HTTP '+r.status);
+        console.error('[sbUpsert] '+table+' failed:',msg,data);
+        throw new Error(msg);
+      }
+      return data;
+    });
+  });
 }
 function sbDelete(table,params){
   return fetch(SB_URL+'/rest/v1/'+table+'?'+params,{method:'DELETE',headers:SB_HDR}).then(function(r){return r.status===204?{}:r.json();});
@@ -1526,11 +1535,12 @@ function startApp(){
   chip.textContent=CURRENT_USER.display_name.charAt(0).toUpperCase();
   if(CURRENT_USER.role==='admin')chip.classList.add('admin');
   document.getElementById('user-display-chip').textContent=CURRENT_USER.display_name;
+  // Hiện nút Edit Nhắc nhở cho tất cả user
+  var tickerBtn = document.getElementById('btn-edit-ticker');
+  if(tickerBtn) tickerBtn.style.display = 'inline-flex';
   // show admin tab
   if(CURRENT_USER.role==='admin'){
     document.getElementById('nav-admin').style.display='flex';
-    var tickerBtn = document.getElementById('btn-edit-ticker');
-    if(tickerBtn) tickerBtn.style.display = 'inline-flex';
     var followupBtn = document.getElementById('btn-edit-followup');
     if(followupBtn) followupBtn.style.display = 'inline-flex';
     var followupBtnCrm = document.getElementById('btn-edit-followup-crm');
@@ -1588,6 +1598,8 @@ async function saveHist(h){
 async function saveHistDay(key,rec){
   if(!CURRENT_USER)return;
   setSyncStatus('syncing');
+  // Luôn lưu local trước
+  try{var lh=JSON.parse(localStorage.getItem('nct2_hist')||'{}');lh[key]=rec;localStorage.setItem('nct2_hist',JSON.stringify(lh));}catch(e){}
   try{
     await sbUpsert('nct_daily_logs',[{
       user_id:CURRENT_USER.id,date:key,
@@ -1595,7 +1607,12 @@ async function saveHistDay(key,rec){
       appt:rec.appt||0,mins:rec.mins||0,r1:rec.r1||0,r2:rec.r2||0
     }],'user_id,date');
     setSyncStatus('ok');
-  }catch(e){setSyncStatus('err');}
+    console.log('[saveHistDay] OK:',key,rec);
+  }catch(e){
+    console.error('[saveHistDay] Lỗi lưu Supabase ngày '+key+':',e.message);
+    setSyncStatus('err');
+    showToast('⚠ Lỗi lưu dữ liệu: '+e.message,'err');
+  }
 }
 async function deleteHistDay(key){
   if(!CURRENT_USER)return;
@@ -3315,10 +3332,12 @@ async function loadAdminData(){
     // Load all users
     var users=await sbGet('nct_users','select=id,username,display_name,role&order=display_name.asc');
     _adminMembers=Array.isArray(users)?users.filter(function(u){return u.role==='member';}):[];
-    // Load all daily logs (30 days)
-    var cut=new Date();cut.setDate(cut.getDate()-30);
+    // Load all daily logs (60 ngày)
+    var cut=new Date();cut.setDate(cut.getDate()-60);
     var cutStr=cut.toISOString().slice(0,10);
+    console.log('[loadAdminData] Tải daily_logs từ:',cutStr);
     var logs=await sbGet('nct_daily_logs','date=gte.'+cutStr+'&select=*');
+    console.log('[loadAdminData] Số bản ghi:',Array.isArray(logs)?logs.length:logs);
     _adminLogs={};
     if(Array.isArray(logs)){
       logs.forEach(function(r){
@@ -3512,7 +3531,7 @@ function syncLogHeight(){
 // =========================================================
 // TOAST & RENDER ALL
 // =========================================================
-function showToast(msg){var t=document.getElementById('toast');document.getElementById('toast-msg').textContent=msg;t.classList.add('show');setTimeout(function(){t.classList.remove('show');},2200);}
+function showToast(msg,type){var t=document.getElementById('toast');document.getElementById('toast-msg').textContent=msg;t.style.background=type==='err'?'#A32D2D':'';t.classList.add('show');setTimeout(function(){t.classList.remove('show');t.style.background='';},3000);}
 function renderAll(){renderScripts();renderObjs();renderFollowup();}
 // Close popups on backdrop click
 document.addEventListener('DOMContentLoaded',function(){
